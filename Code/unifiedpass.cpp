@@ -23,11 +23,11 @@
 #include <llvm/Pass.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <memory>
 
 using namespace llvm;
 
 namespace {
-
     std::string getShortValueName(const Value* V) {
         if (!V) return "(null)";
         if (V->hasName()) return "%" + V->getName().str();
@@ -914,9 +914,50 @@ namespace {
             return PreservedAnalyses::all();
         }
     };
+    // -------------------- Point-to Analysis --------------------
+    //Andersen Method
+    class AndersenPTA {
+    public:
+        Function& F;
+        AndersenPTA(Function& F_) : F(F_) {}
+        void run() {
+        }
+        bool mayAlias(Value* A, Value* B) {
+            return true;
+        }
+    };
+    //Steensgaard Method
+    class SteensgaardPTA {
+    public:
+        Function& F;
+        SteensgaardPTA(Function& F_) : F(F_) {}
+        void run() {
+        }
+        bool mayAlias(Value* A, Value* B) {
+            return true;
+        }
+    };
+    enum class PTAType {
+        Andersen,
+        Steensgaard
+    };
     // -------------------- LICM --------------------
-
-    struct LoopInvariantCodeMotion : PassInfoMixin<LoopInvariantCodeMotion> {
+    struct LoopInvariantCodeMotion : PassInfoMixin<LoopInvariantCodeMotion> {    
+        PTAType Mode;
+        std::unique_ptr<AndersenPTA> Andersen;
+        std::unique_ptr<SteensgaardPTA> Steensgaard;
+        //Set mode for Andersen or Steensgaard
+        LoopInvariantCodeMotion(PTAType M = PTAType::Andersen)
+            : Mode(M) {}
+        
+        bool mayAlias(Value* A, Value* B) {
+            if (Mode == PTAType::Andersen) {
+                return Andersen->mayAlias(A, B);
+            }
+            else {
+                return Steensgaard->mayAlias(A, B);
+            }
+        }
         bool dominates(const DominatorsPass::Result& Dom, BasicBlock* A, BasicBlock* B) const {
             unsigned indA = Dom.index.lookup(A);
             const BitVector& inB = Dom.in.lookup(B);
@@ -941,6 +982,15 @@ namespace {
                 return PreservedAnalyses::all();
             }
             Function& F = *L.getHeader()->getParent();
+            //run the desired points-to analysis
+            if (Mode == PTAType::Andersen) {
+                Andersen = std::make_unique<AndersenPTA>(F);
+                Andersen->run();
+            }
+            else {
+                Steensgaard = std::make_unique<SteensgaardPTA>(F);
+                Steensgaard->run();
+            }
             //get dominators for current loop
             FunctionAnalysisManager tempFAM;
             //set dominators to no print
@@ -967,9 +1017,65 @@ namespace {
                 for (BasicBlock* BB : L.blocks()) {
                     for (Instruction& I : *BB) {
                         //check for instructions that are already in the invariant list or cannot be invariant
-                        if (hoistInvariant.contains(&I) || I.isTerminator() || I.mayHaveSideEffects() || isa<PHINode>(&I)) {
+                        if (hoistInvariant.contains(&I) || I.isTerminator() || isa<PHINode>(&I)) {
                             continue;
                         }
+                        //--------------------THIS IS FOR LOAD INVARIANT EXPRESSIONS-------------------
+                        if (auto* loadI = dyn_cast<LoadInst>(&I)) {
+                            Value* ptr = loadI->getPointerOperand();
+                            //check if address is invarient, if not this is not loop-inv
+                            if (!invariantValues.contains(ptr)) {
+                                continue;
+                            }
+                            bool killed = false;
+                            //check all the instructions in the loop and compute what they store
+                            for (BasicBlock* loopBB : L.blocks()) {
+                                for (Instruction& loopI : *loopBB) {
+                                    if (auto* storeI = dyn_cast<StoreInst>(&loopI)) {
+                                        //check and see if the store kills this pointer
+                                        if (mayAlias(ptr, storeI->getPointerOperand())) {
+                                            killed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                //exit loop when killed
+                                if (killed) {
+                                    break;
+                                }
+                            }
+                            //if the instruciton has been killed skip to next
+                            if (killed) {
+                                continue;
+                            }
+                            //the load must dominate all uses outside of the loop
+                            bool safe = true;
+                            for (User* U : I.users()) {
+                                //extract all uses
+                                Instruction* useI = dyn_cast<Instruction>(U);
+                                if (!useI) {
+                                    continue;
+                                }
+                                //check if the instruction dominates the use
+                                BasicBlock* useBB = useI->getParent();
+                                if (!L.contains(useBB)) {
+                                    if (!dominates(dom, I.getParent(), useBB)) {
+                                        safe = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            //if not safe, instruction is should not be hoisted
+                            if (!safe) {
+                                continue;
+                            }
+                            //add loop invariant load to both lists
+                            hoistInvariant.insert(loadI);
+                            invariantValues.insert(loadI);
+                            changed = true;
+                            continue;
+                        }
+                        //--------------------THIS IS FOR PURE COMPUTATION INVARIANT EXPRESSIONS-------------------
                         //check if the operand is an invariant operand
                         bool opInv = true;
                         for (Value* Op : I.operands()) {
@@ -1222,11 +1328,17 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
                   }
             );
             PB.registerPipelineParsingCallback([](StringRef Name, LoopPassManager& LPM, ArrayRef<PassBuilder::PipelineElement>) -> bool {
-                        if (Name == "loop-invariant-code-motion") {
-                            LPM.addPass(LoopInvariantCodeMotion());
-                            return true;
-                        }
-                    return false;
+                if (Name == "licm-andersen") {
+                    LPM.addPass(LoopInvariantCodeMotion(PTAType::Andersen));
+                    return true;
+                }
+
+                if (Name == "licm-steensgaard") {
+                    LPM.addPass(LoopInvariantCodeMotion(PTAType::Steensgaard));
+                    return true;
+                }
+
+                return false;
                 }
             );
 

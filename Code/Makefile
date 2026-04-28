@@ -5,7 +5,7 @@ BUILDDIR     = build
 DEPDIR       = $(BUILDDIR)/.deps
 DEPFLAGS     = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
 
-TESTS             = dominators licm licm2 licm3 licm4 dce1 dce2 dce3 dce4 dce5
+TESTS             = dominators licm licm2 licm3 licm4
 OPTIMIZER_SOURCES = unifiedpass.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 TESTS_PRE         = $(TESTS:%=$(BUILDDIR)/tests/%-m2r.ll)
@@ -28,11 +28,11 @@ $(BUILDDIR)/%.so: $(BUILDDIR)/%.o
 
 $(BUILDDIR)/tests/%-opt.bc: tests/%-test-m2r.bc $(OPTIMIZER_LIBS) | $(BUILDDIR)/tests
 	@if echo "$*" | grep -q "licm"; then \
-		echo "----------------------------------------------------------"; \
-		echo "----------------Running LICM test: $*----------------"; \
-		echo "----------------------------------------------------------"; \
+		echo "----------------------------------------------------------------------------"; \
+		echo "----------------Running LICM with Andersen's Method test: $*----------------"; \
+		echo "----------------------------------------------------------------------------"; \
 		opt -bugpoint-enable-legacy-pm=1 $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) \
-			-passes='loop-simplify,loop(loop-invariant-code-motion)' $< -o $@; \
+			-passes='loop-simplify,loop(licm-andersen)' $< -o $@; \
 		echo "--- BEFORE LICM stats for $*"; \
 		lli -stats -force-interpreter $< 2>&1; \
 		echo "--- AFTER LICM stats for $*"; \
