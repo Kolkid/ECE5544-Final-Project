@@ -5,7 +5,7 @@ BUILDDIR     = build
 DEPDIR       = $(BUILDDIR)/.deps
 DEPFLAGS     = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
 
-TESTS             = dominators licm licm2 licm3 licm4
+TESTS             = loads1 loads2 loads3 loads4
 OPTIMIZER_SOURCES = unifiedpass.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 TESTS_PRE         = $(TESTS:%=$(BUILDDIR)/tests/%-m2r.ll)
@@ -27,7 +27,7 @@ $(BUILDDIR)/%.so: $(BUILDDIR)/%.o
 	$(CXX) -shared $^ -o $@ $(LDFLAGS)
 
 $(BUILDDIR)/tests/%-opt.bc: tests/%-test-m2r.bc $(OPTIMIZER_LIBS) | $(BUILDDIR)/tests
-	@if echo "$*" | grep -q "licm"; then \
+	@if echo "$*" | grep -q "loads"; then \
 		echo "----------------------------------------------------------------------------"; \
 		echo "----------------Running LICM with Andersen's Method test: $*----------------"; \
 		echo "----------------------------------------------------------------------------"; \

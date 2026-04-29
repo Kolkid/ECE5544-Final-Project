@@ -14,3 +14,12 @@ void ex2(int **pp, int **qq, int *x, int *y, int n) {
         sink += v;
     }
 }
+int main() {
+    int x = 0, y = 0;
+    int *px = &x;
+    int *py = &y;
+    int *pp = NULL;
+    int *qq = NULL;
+    ex2(&pp, &qq, px, py, 10);
+    return 0;
+}

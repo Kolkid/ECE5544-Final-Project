@@ -10,6 +10,7 @@
 
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
@@ -919,13 +920,118 @@ namespace {
     class AndersenPTA {
     public:
         Function& F;
+        DenseMap<Value*, SmallPtrSet<Value*, 8>> points;
+        DenseMap<Value*, SmallPtrSet<Value*, 8>> incl;
+        DenseMap<Value*, SmallPtrSet<Value*, 8>> storeEdges;
+
         AndersenPTA(Function& F_) : F(F_) {}
-        void run() {
+
+        //add map showing a dest pointer inluding everything in the source pointer  
+        void addInclude(Value* dst, Value* src) {
+            incl[dst].insert(src);
         }
+
+        //add value to map of direct pointers to memory
+        void addPointsTo(Value* dst, Value* obj) {
+            points[dst].insert(obj);
+        }
+
+        //run Andersen's Method
+        void run() {
+            //treat each object as its own argument
+            for (Argument& A : F.args()) {
+                if (A.getType()->isPointerTy()) {
+                    addPointsTo(&A, &A);
+                }
+            }
+            //add all types of pointers to the maps
+            for (BasicBlock& BB : F) {
+                for (Instruction& I : BB) {
+                    //add pointer that allocates this memory to the direct pointer map (p = alloc)
+                    if (auto* allocI = dyn_cast<AllocaInst>(&I)) {
+                        addPointsTo(allocI, allocI);
+                    }
+                    //add pointer that points to the same object as another pointer to the include map (p = &q)
+                    if (auto* bitI = dyn_cast<BitCastInst>(&I)) {
+                        if (bitI->getOperand(0)->getType()->isPointerTy()) {
+                            addInclude(bitI, bitI->getOperand(0));
+                        }
+                    }
+                    //make the load map to the pointer it is loading (p = load q)
+                    if (auto* loadI = dyn_cast<LoadInst>(&I)) {
+                        Value* q = loadI->getPointerOperand();
+                        addInclude(loadI, q);
+                    }
+                    //the stored pointer contains what ever p points to, add the edge to the storeEdges map (store p = q)
+                    if (auto* storeI = dyn_cast<StoreInst>(&I)) {
+                        Value* p = storeI->getValueOperand();
+                        Value* q = storeI->getPointerOperand();
+                        if (p->getType()->isPointerTy()) {
+                            storeEdges[q].insert(p);
+                        }
+                    }
+                }
+            }
+            //perform fixed-point aglorithm to determine each pointer's contents
+            fixedPointAndersen();
+        }
+        //Andersen fixed-point algorithm
+        void fixedPointAndersen() {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                //loop through all elements in the include map
+                for (auto& entry : incl) {
+                    //extract destination and its source set
+                    Value* dst = entry.first;
+                    auto& srcSet = entry.second;
+                    for (Value* src : srcSet) {
+                        //check and see if the destinations set that it points to needs to be updated
+                        for (Value* obj : points[src]) {
+                            if (!points[dst].contains(obj)) {
+                                points[dst].insert(obj);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                //loop through elements in the storeEdges map
+                for (auto& entry : storeEdges) {
+                    //extract pointer (q) and its set of all pointers stored into *q
+                    Value* q = entry.first;
+                    auto& pointSet = entry.second;
+                    for (Value* p : pointSet) {
+                        //iterate through each object in the points-to set of q
+                        for (Value* obj : points[q]) {
+                            //iterate through each object in the points-to set of p
+                            for (Value* objPts : points[p]) {
+                                //scan elements to see what was newly inserted if we need to continue fixed-point
+                                if (points[obj].insert(objPts).second) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        //checks to see if the values alias
         bool mayAlias(Value* A, Value* B) {
-            return true;
+            //no points-to info
+            if (!points.count(A) || !points.count(B)) {
+                return true;
+            }
+            for (Value* x : points[A]) {
+                //check if points-to sets intersect
+                if (points[B].contains(x)) {
+                    return true;
+                }
+            }
+            //no aliasing 
+            return false;
         }
     };
+
     //Steensgaard Method
     class SteensgaardPTA {
     public:
@@ -1075,6 +1181,10 @@ namespace {
                             changed = true;
                             continue;
                         }
+                        //exclude all store instructions beyond this point
+                        if (I.mayHaveSideEffects()) {
+                            continue;
+                        }
                         //--------------------THIS IS FOR PURE COMPUTATION INVARIANT EXPRESSIONS-------------------
                         //check if the operand is an invariant operand
                         bool opInv = true;
@@ -1134,86 +1244,32 @@ namespace {
                 I->print(outs());
                 outs() << "\n";
             }
-            //start the instruction moving procedure
-            //determine nessesary blocks and connections for code motion
-            BasicBlock* header = L.getHeader();
-            auto* headerBr = cast<BranchInst>(header->getTerminator());
-            Value* cond = headerBr->getCondition();
-            BasicBlock* taken = headerBr->getSuccessor(0);
-            BasicBlock* notTaken = headerBr->getSuccessor(1);
-            BasicBlock* body = nullptr;
-            BasicBlock* exit = nullptr;
-            //determine which block is loop body and which block is the exit
-            if (L.contains(taken) && !L.contains(notTaken)) {
-                body = taken;
-                exit = notTaken;
-            }
-            else {
-                assert(L.contains(notTaken) && !L.contains(taken));
-                body = notTaken;
-                exit = taken;
-            }
-            //define a landing pad and a test block
-            LLVMContext& ctx = F.getContext();
-            BasicBlock* testBB = BasicBlock::Create(ctx, header->getName() + ".test", &F);
-            BasicBlock* landingPadBB = BasicBlock::Create(ctx, header->getName() + ".lp", &F);
-            //link preheader to test block
-            auto* preTerm = preheader->getTerminator();
-            assert(isa<BranchInst>(preTerm) && preTerm->getNumSuccessors() == 1);
-            preTerm->setSuccessor(0, testBB);
-            //loop condition building
-            IRBuilder<> B(testBB);
-            Value* testCond = nullptr;
-            //check if the loop condition is icmp
-            if (auto* cmp = dyn_cast<ICmpInst>(cond)) {
-                //extract operands, adjust PHIs, and set test cond with updated PHIs
-                Value* LHS = cmp->getOperand(0);
-                Value* RHS = cmp->getOperand(1);
-                LHS = remapHeaderPhi(LHS, header, preheader);
-                RHS = remapHeaderPhi(RHS, header, preheader);
-                testCond = B.CreateICmp(cmp->getPredicate(), LHS, RHS);
-            }
-            //condition is the same
-            else {
-                testCond = cond;
-            }
-            //insert conditional and connect to landing pad and exit
-            B.CreateCondBr(testCond, landingPadBB, exit);
-            IRBuilder<> LPB(landingPadBB);
-            LPB.CreateBr(header);
-            //move all the hoistable instructions to the landing pad
-            for (Instruction* I : hoistInvariant) {
-                //silence the depricated warning
+            //create a vector that will be used to sort the hoistable instructions
+            SmallVector<Instruction*, 32> toHoist;
+            toHoist.reserve(hoistInvariant.size());
+            for (Instruction* I : hoistInvariant)
+                toHoist.push_back(I);
+
+            //sort the instrucitons by dominance
+            llvm::sort(toHoist, [&](Instruction* A, Instruction* B) {
+                if (dominates(dom, A->getParent(), B->getParent())) {
+                    return true;
+                }
+                if (dominates(dom, B->getParent(), A->getParent())) {
+                    return false;
+                }
+                return A < B;
+                }
+            );
+
+            //now hoist the sorted instructions in order
+            for (Instruction* I : toHoist) {
                 #pragma clang diagnostic push
                 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                I->moveBefore(landingPadBB->getTerminator());
-                //unsilence depricated warnings
+                I->moveBefore(preheader->getTerminator());
                 #pragma clang diagnostic pop
             }
-            //update PHIs in the landing pad block
-            for (Instruction& Inst : *header) {
-                auto* PN = dyn_cast<PHINode>(&Inst);
-                if (!PN) { 
-                    break; 
-                }
-                int ind = PN->getBasicBlockIndex(preheader);
-                if (ind >= 0) {
-                    PN->setIncomingBlock(ind, landingPadBB);
-                }
-            }
-            //update PHIs in the test block
-            for (Instruction& Inst : *exit) {
-                auto* PN = dyn_cast<PHINode>(&Inst);
-                if (!PN) {
-                    break;
-                }
-                int headerInd = PN->getBasicBlockIndex(header);
-                if (headerInd < 0) {
-                    continue;
-                }
-                PN->addIncoming(UndefValue::get(PN->getType()), testBB);
-            }
-            return PreservedAnalyses::all();
+            return PreservedAnalyses::none();
         }
     };
 
