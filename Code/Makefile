@@ -4,8 +4,8 @@ LDFLAGS      = $(shell llvm-config --ldflags | tr '\n' ' ') -Wl,--exclude-libs,A
 BUILDDIR     = build
 DEPDIR       = $(BUILDDIR)/.deps
 DEPFLAGS     = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
-
-TESTS             = loads1 loads2 loads3 loads4
+LICM_PASS    = licm-andersen
+TESTS             = loads1 loads2 loads3 loads4 loads5
 OPTIMIZER_SOURCES = unifiedpass.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 TESTS_PRE         = $(TESTS:%=$(BUILDDIR)/tests/%-m2r.ll)
@@ -29,14 +29,21 @@ $(BUILDDIR)/%.so: $(BUILDDIR)/%.o
 $(BUILDDIR)/tests/%-opt.bc: tests/%-test-m2r.bc $(OPTIMIZER_LIBS) | $(BUILDDIR)/tests
 	@if echo "$*" | grep -q "loads"; then \
 		echo "----------------------------------------------------------------------------"; \
-		echo "----------------Running LICM with Andersen's Method test: $*----------------"; \
+		echo "----------------Running $(LICM_PASS) on test: $*----------------"; \
 		echo "----------------------------------------------------------------------------"; \
 		opt -bugpoint-enable-legacy-pm=1 $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) \
-			-passes='loop-simplify,loop(licm-andersen)' $< -o $@; \
+			-passes='loop-simplify,loop($(LICM_PASS))' $< -o $@; \
 		echo "--- BEFORE LICM stats for $*"; \
 		lli -stats -force-interpreter $< 2>&1; \
 		echo "--- AFTER LICM stats for $*"; \
 		lli -stats -force-interpreter $@ 2>&1; \
+		echo "--- Running LICM optimization (timed) for $*"; \
+		/usr/bin/time -f "opt time: real %e  user %U  sys %S" -o $@.time \
+			opt -bugpoint-enable-legacy-pm=1 $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) \
+				-passes='loop-simplify,loop($(LICM_PASS))' $< -o $@ \
+				>/dev/null 2>/dev/null; \
+		cat $@.time; \
+		rm $@.time; \
 	elif echo "$*" | grep -q "dce"; then \
 		echo "----------------------------------------------------------"; \
 		echo "----------------Running DCE test: $*----------------"; \

@@ -916,6 +916,7 @@ namespace {
         }
     };
     // -------------------- Point-to Analysis --------------------
+    /*
     //Andersen Method
     class AndersenPTA {
     public:
@@ -1031,8 +1032,7 @@ namespace {
             return false;
         }
     };
-
-    //Steensgaard Method
+    */
     //Andersen Method
     class AndersenPTA {
     public:
@@ -1257,7 +1257,8 @@ namespace {
     };
     enum class PTAType {
         Andersen,
-        Steensgaard
+        Steensgaard,
+        LICM
     };
     // -------------------- LICM --------------------
     struct LoopInvariantCodeMotion : PassInfoMixin<LoopInvariantCodeMotion> {    
@@ -1305,7 +1306,7 @@ namespace {
                 Andersen = std::make_unique<AndersenPTA>(F);
                 Andersen->run();
             }
-            else {
+            else if(Mode == PTAType::Steensgaard) {
                 Steensgaard = std::make_unique<SteensgaardPTA>(F);
                 Steensgaard->run();
             }
@@ -1338,60 +1339,70 @@ namespace {
                         if (hoistInvariant.contains(&I) || I.isTerminator() || isa<PHINode>(&I)) {
                             continue;
                         }
-                        //--------------------THIS IS FOR LOAD INVARIANT EXPRESSIONS-------------------
-                        if (auto* loadI = dyn_cast<LoadInst>(&I)) {
-                            Value* ptr = loadI->getPointerOperand();
-                            //check if address is invarient, if not this is not loop-inv
-                            if (!invariantValues.contains(ptr)) {
-                                continue;
-                            }
-                            bool killed = false;
-                            //check all the instructions in the loop and compute what they store
-                            for (BasicBlock* loopBB : L.blocks()) {
-                                for (Instruction& loopI : *loopBB) {
-                                    if (auto* storeI = dyn_cast<StoreInst>(&loopI)) {
-                                        //check and see if the store kills this pointer
-                                        if (mayAlias(ptr, storeI->getPointerOperand())) {
-                                            killed = true;
+                        //skip load instr in classic mode
+                        if (Mode == PTAType::LICM && isa<LoadInst>(&I)) {
+                            continue;
+                        }
+                        //if classic LICM skip load invariant
+                        if (Mode != PTAType::LICM) {
+                            //--------------------THIS IS FOR LOAD INVARIANT EXPRESSIONS-------------------
+                            if (auto* loadI = dyn_cast<LoadInst>(&I)) {
+                                Value* ptr = loadI->getPointerOperand();
+                                //check if address is invarient, if not this is not loop-inv
+                                if (!invariantValues.contains(ptr)) {
+                                    continue;
+                                }
+                                bool killed = false;
+                                //check all the instructions in the loop and compute what they store
+                                for (BasicBlock* loopBB : L.blocks()) {
+                                    for (Instruction& loopI : *loopBB) {
+                                        if (auto* storeI = dyn_cast<StoreInst>(&loopI)) {
+                                            //check and see if the store kills this pointer
+                                            if (mayAlias(ptr, storeI->getPointerOperand())) {
+                                                killed = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    //exit loop when killed
+                                    if (killed) {
+                                        break;
+                                    }
+                                }
+                                //if the instruciton has been killed skip to next
+                                if (killed) {
+                                    continue;
+                                }
+                                //the load must dominate all uses outside of the loop
+                                bool safe = true;
+                                for (User* U : I.users()) {
+                                    //extract all uses
+                                    Instruction* useI = dyn_cast<Instruction>(U);
+                                    if (!useI) {
+                                        continue;
+                                    }
+                                    //check if the instruction dominates the use
+                                    BasicBlock* useBB = useI->getParent();
+                                    if (!L.contains(useBB)) {
+                                        if (!dominates(dom, I.getParent(), useBB)) {
+                                            safe = false;
                                             break;
                                         }
                                     }
                                 }
-                                //exit loop when killed
-                                if (killed) {
-                                    break;
-                                }
-                            }
-                            //if the instruciton has been killed skip to next
-                            if (killed) {
-                                continue;
-                            }
-                            //the load must dominate all uses outside of the loop
-                            bool safe = true;
-                            for (User* U : I.users()) {
-                                //extract all uses
-                                Instruction* useI = dyn_cast<Instruction>(U);
-                                if (!useI) {
+                                //if not safe, instruction is should not be hoisted
+                                if (!safe) {
                                     continue;
                                 }
-                                //check if the instruction dominates the use
-                                BasicBlock* useBB = useI->getParent();
-                                if (!L.contains(useBB)) {
-                                    if (!dominates(dom, I.getParent(), useBB)) {
-                                        safe = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            //if not safe, instruction is should not be hoisted
-                            if (!safe) {
+                                //add loop invariant load to both lists
+                                outs() << "Hoistable load detected: ";
+                                loadI->print(outs());
+                                outs() << "\n";
+                                hoistInvariant.insert(loadI);
+                                invariantValues.insert(loadI);
+                                changed = true;
                                 continue;
                             }
-                            //add loop invariant load to both lists
-                            hoistInvariant.insert(loadI);
-                            invariantValues.insert(loadI);
-                            changed = true;
-                            continue;
                         }
                         //exclude all store instructions beyond this point
                         if (I.mayHaveSideEffects()) {
@@ -1603,6 +1614,10 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
 
                 if (Name == "licm-steensgaard") {
                     LPM.addPass(LoopInvariantCodeMotion(PTAType::Steensgaard));
+                    return true;
+                }
+                if (Name == "licm-classic") {
+                    LPM.addPass(LoopInvariantCodeMotion(PTAType::LICM));
                     return true;
                 }
 

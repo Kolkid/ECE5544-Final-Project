@@ -1,61 +1,27 @@
-# Assignment 3 Starter Code and Use Notes
+# Final Project Code and Use Notes
 -----------------------------------------------------------------------------------------------------
-In order to run the tests on this program enter the following commands:
-go to the directory with unifiedpass.cpp
-- make
-This will make unifiedpass.cpp
-- make tests
-This will run all the tests and print the output for each pass in unifiedpass.cpp
+IMPORTANT: You MUST install time in order to run the tests and see the timing for each of the passes
+Run these 2 cmds in the environment 
+  apt-get update
+  apt-get install -y time
 
-The dominators pass will print the in sets and outsets for every BB of the converged program. It will also print all dominator relationships
-The LICM code will print all of the hoistable instructions and all of the stats before (unoptimized) and after (optimized) code. 
-There are a total of 4 LICM tests.
+
+This program has 3 different LICM modes: licm-classic, licm-andersen, licm-steensgaard
+
+Steps to run test on desired mode:
+1. Edit the makefile line and replace DESIRED TEST with one of the three modes (default is licm-andersen)
+      LICM_PASS    = DESIRED TEST
+2. Go to the directory with unifiedpass.cpp
+3. Run: make 
+4. Run: make tests
+5. The output will show the results of the 5 micro benchmarks
+
+Interpereting the results:
+The results will be printed with the following information in the following order:
+- List of every hoistable load
+- List of all hoistable instrucitons
+- Statistics before test program optimization
+- Statistics after test program optimization
+- Execution time of the pass on the test program
+
 -----------------------------------------------------------------------------------------------------
-
-This starter package contains:
-- `unifiedpass.cpp`: LLVM plugin starter with
-  - reusable fixed-point dataflow engine skeleton
-  - set-print helper utilities
-  - a partially wired Available Expressions template (with TODO transfer logic)
-  - a map-based Constant Propagation starter using a 3-point lattice
-    (`TOP`, `Const`, `NAC`) with TODO extension points
-  - pass registration for
-  - `available`
-  - `liveness`
-  - `reaching`
-  - `constantprop`
-  - `Dominators`
-  - `Dead Code Elimination`
-  - `LICM`
-- `Makefile`: build + run targets
-- `tests/`: 4 provided test inputs (`*.bc`)
-
-## Build
-
-```bash
-make
-```
-
-This builds `build/unifiedpass.so`.
-
-## Run all tests
-
-```bash
-make tests
-```
-
-This generates:
-- `build/tests/*-m2r.ll` (disassembled inputs)
-- `build/tests/*-opt.ll` (outputs after running each pass)
-
-## Run one pass manually
-
-```bash
-opt -bugpoint-enable-legacy-pm=1 \
-  -load-pass-plugin=build/unifiedpass.so \
-  -passes='available' tests/available-test-m2r.bc -o /tmp/out.bc
-```
-
-Replace `available` with one of: `liveness`, `reaching`, `constantprop`.
-
-
