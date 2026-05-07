@@ -1033,14 +1033,226 @@ namespace {
     };
 
     //Steensgaard Method
+    //Andersen Method
+    class AndersenPTA {
+    public:
+        Function& F;
+        DenseMap<Value*, SmallPtrSet<Value*, 8>> points;
+        DenseMap<Value*, SmallPtrSet<Value*, 8>> incl;
+        DenseMap<Value*, SmallPtrSet<Value*, 8>> storeEdges;
+
+        AndersenPTA(Function& F_) : F(F_) {}
+
+        //add map showing a dest pointer inluding everything in the source pointer  
+        void addInclude(Value* dst, Value* src) {
+            incl[dst].insert(src);
+        }
+
+        //add value to map of direct pointers to memory
+        void addPointsTo(Value* dst, Value* obj) {
+            points[dst].insert(obj);
+        }
+
+        //run Andersen's Method
+        void run() {
+            //treat each object as its own argument
+            for (Argument& A : F.args()) {
+                if (A.getType()->isPointerTy()) {
+                    addPointsTo(&A, &A);
+                }
+            }
+            //add all types of pointers to the maps
+            for (BasicBlock& BB : F) {
+                for (Instruction& I : BB) {
+                    //add pointer that allocates this memory to the direct pointer map (p = alloc)
+                    if (auto* allocI = dyn_cast<AllocaInst>(&I)) {
+                        addPointsTo(allocI, allocI);
+                    }
+                    //add pointer that points to the same object as another pointer to the include map (p = &q)
+                    if (auto* bitI = dyn_cast<BitCastInst>(&I)) {
+                        if (bitI->getOperand(0)->getType()->isPointerTy()) {
+                            addInclude(bitI, bitI->getOperand(0));
+                        }
+                    }
+                    //make the load map to the pointer it is loading (p = load q)
+                    if (auto* loadI = dyn_cast<LoadInst>(&I)) {
+                        Value* q = loadI->getPointerOperand();
+                        addInclude(loadI, q);
+                    }
+                    //the stored pointer contains what ever p points to, add the edge to the storeEdges map (store p = q)
+                    if (auto* storeI = dyn_cast<StoreInst>(&I)) {
+                        Value* p = storeI->getValueOperand();
+                        Value* q = storeI->getPointerOperand();
+                        if (p->getType()->isPointerTy()) {
+                            storeEdges[q].insert(p);
+                        }
+                    }
+                }
+            }
+            //perform fixed-point aglorithm to determine each pointer's contents
+            fixedPointAndersen();
+        }
+        //Andersen fixed-point algorithm
+        void fixedPointAndersen() {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                //loop through all elements in the include map
+                for (auto& entry : incl) {
+                    //extract destination and its source set
+                    Value* dst = entry.first;
+                    auto& srcSet = entry.second;
+                    for (Value* src : srcSet) {
+                        //check and see if the destinations set that it points to needs to be updated
+                        for (Value* obj : points[src]) {
+                            if (!points[dst].contains(obj)) {
+                                points[dst].insert(obj);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                //loop through elements in the storeEdges map
+                for (auto& entry : storeEdges) {
+                    //extract pointer (q) and its set of all pointers stored into *q
+                    Value* q = entry.first;
+                    auto& pointSet = entry.second;
+                    for (Value* p : pointSet) {
+                        //iterate through each object in the points-to set of q
+                        for (Value* obj : points[q]) {
+                            //iterate through each object in the points-to set of p
+                            for (Value* objPts : points[p]) {
+                                //scan elements to see what was newly inserted if we need to continue fixed-point
+                                if (points[obj].insert(objPts).second) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        //checks to see if the values alias
+        bool mayAlias(Value* A, Value* B) {
+            //no points-to info
+            if (!points.count(A) || !points.count(B)) {
+                return true;
+            }
+            for (Value* x : points[A]) {
+                //check if points-to sets intersect
+                if (points[B].contains(x)) {
+                    return true;
+                }
+            }
+            //no aliasing 
+            return false;
+        }
+    };
+
+    //Steensgaard Method
     class SteensgaardPTA {
     public:
         Function& F;
+
+        DenseMap<Value*, Value*> parent;
+
         SteensgaardPTA(Function& F_) : F(F_) {}
-        void run() {
+
+        Value* find(Value* V) {
+            if (!parent.count(V)) {
+                parent[V] = V;
+                return V;
+            }
+
+            if (parent[V] == V) {
+                return V;
+            }
+
+            // Path compression.
+            parent[V] = find(parent[V]);
+            return parent[V];
         }
+
+        // Merge the equivalence classes for A and B.
+        // simplified unification step.
+        void unite(Value* A, Value* B) {
+            Value* RepA = find(A);
+            Value* RepB = find(B);
+
+            if (RepA != RepB) {
+                parent[RepB] = RepA;
+            }
+        }
+
+        void run() {
+            // Initialize pointer arguments as known pointer values.
+            for (Argument& Arg : F.args()) {
+                if (Arg.getType()->isPointerTy()) {
+                    find(&Arg);
+                }
+            }
+
+            // Flow-insensitive scan: process each instruction once.
+            for (BasicBlock& BB : F) {
+                for (Instruction& I : BB) {
+
+                    // alloca creates a stack memory object represented by a pointer.
+                    if (auto* AllocaI = dyn_cast<AllocaInst>(&I)) {
+                        find(AllocaI);
+                    }
+
+                    // bitcast/gep preserve pointer origin in this simplified model.
+                    if (auto* BitcastI = dyn_cast<BitCastInst>(&I)) {
+                        if (BitcastI->getType()->isPointerTy() &&
+                            BitcastI->getOperand(0)->getType()->isPointerTy()) {
+                            unite(BitcastI, BitcastI->getOperand(0));
+                        }
+                    }
+
+                    // If a pointer is loaded from memory, conservatively connect
+                    // the loaded pointer value with the memory location it came from.
+                    if (auto* LoadI = dyn_cast<LoadInst>(&I)) {
+                        if (LoadI->getType()->isPointerTy()) {
+                            unite(LoadI, LoadI->getPointerOperand());
+                        }
+                    }
+
+                    // If a pointer value is stored into memory, conservatively connect
+                    // the stored pointer with the destination memory location.
+                    if (auto* StoreI = dyn_cast<StoreInst>(&I)) {
+                        Value* StoredValue = StoreI->getValueOperand();
+                        Value* StoreDest = StoreI->getPointerOperand();
+
+                        if (StoredValue->getType()->isPointerTy()) {
+                            unite(StoredValue, StoreDest);
+                        }
+                    }
+
+                    // Treat GEP as derived from its base pointer
+                    // field-insensitive / offset-insensitive
+                    if (auto* GEPI = dyn_cast<GetElementPtrInst>(&I)) {
+                        if (GEPI->getType()->isPointerTy() &&
+                            GEPI->getPointerOperand()->getType()->isPointerTy()) {
+                            unite(GEPI, GEPI->getPointerOperand());
+                        }
+                    }
+                }
+            }
+        }
+
         bool mayAlias(Value* A, Value* B) {
-            return true;
+            if (!A || !B) {
+                return true;
+            }
+            if (!A->getType()->isPointerTy() || !B->getType()->isPointerTy()) {
+                return false;
+            }
+            // prevents untracked SSA vals from being incorrectly treated as no-alias
+            if (!parent.count(A) || !parent.count(B)) {
+                return true;
+            }
+
+            return find(A) == find(B);
         }
     };
     enum class PTAType {
