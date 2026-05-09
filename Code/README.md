@@ -36,7 +36,7 @@ The results will be printed with the following information in the following orde
 
 ## NPB Macrobenchmark Tests
 The NPB benchmark bitcode files are included in: `npb_bc/`
-The two benchmark inputs used are: `ep.bc`,`cg.bc`
+The two benchmark inputs used are: `ep.bc`,`is.bc`,`ft.bc`,`cg.bc`,
 
 EP was used as a lightweight real-program smoke test. CG was used as the more memory-oriented benchmark because it contains more loop and memory-access behavior relevant to alias-aware load hoisting.
 Before running the NPB tests, build the pass:
@@ -47,16 +47,18 @@ To run the LICM passes on the NPB bitcode:
 ```bash
 mkdir -p results
 
-for b in ep cg; do
+for b in ep is ft cg; do
   for p in classic andersen steensgaard; do
     echo "=== $b $p ==="
-    { time opt -bugpoint-enable-legacy-pm=1 \
+
+    /usr/bin/time -f "opt time: real %e  user %U  sys %S" \
+      -o results/${b}-${p}.time \
+      opt -bugpoint-enable-legacy-pm=1 \
       -load-pass-plugin=build/unifiedpass.so \
       -passes="licm-$p" \
       npb_bc/${b}.bc \
       -o npb_bc/${b}-${p}.bc \
-      > results/${b}-${p}.out; } \
-      2> results/${b}-${p}.time
+      > results/${b}-${p}.out 2>&1
   done
 done
 ```
@@ -64,38 +66,28 @@ done
 To verify the optimized bitcode:
 No output from the verifier means the optimized LLVM IR is structurally valid.
 ```bash
-for b in ep cg; do
+for b in ep is ft cg; do
   for p in classic andersen steensgaard; do
     opt -passes='verify' npb_bc/${b}-${p}.bc -o /dev/null
   done
 done
 ```
 
-### Counting Hoisted Instructions
-To count all reported hoisted instructions:
+### Counting Hoisted Instructions and Loads
+To count all reported hoisted instructions and only hoisted loads:
 ```bash
-echo "benchmark,pass,hoisted_instruction_count" > results/npb_hoisted_instruction_counts.csv
+echo "benchmark,pass,hoisted_instruction_count,hoisted_load_count" > results/npb_counts.csv
 
-for b in ep cg; do
+for b in ep is ft cg; do
   for p in classic andersen steensgaard; do
-    count=$(grep -E "^[[:space:]]+%" results/${b}-${p}.out | wc -l)
-    echo "$b,$p,$count" >> results/npb_hoisted_instruction_counts.csv
+    inst_count=$(grep -E "^[[:space:]]+%" results/${b}-${p}.out | wc -l)
+    load_count=$(grep -E "^[[:space:]]+%.*= load " results/${b}-${p}.out | wc -l)
+
+    echo "$b,$p,$inst_count,$load_count" >> results/npb_counts.csv
   done
 done
 
-cat results/npb_hoisted_instruction_counts.csv
+cat results/npb_counts.csv
 ```
-To count only hoisted loads:
-```bash
-echo "benchmark,pass,hoisted_load_count" > results/npb_hoisted_load_counts.csv
 
-for b in ep cg; do
-  for p in classic andersen steensgaard; do
-    count=$(grep -E "^[[:space:]]+%.*= load " results/${b}-${p}.out | wc -l)
-    echo "$b,$p,$count" >> results/npb_hoisted_load_counts.csv
-  done
-done
-
-cat results/npb_hoisted_load_counts.csv
-```
 -----------------------------------------------------------------------------------------------------
