@@ -1041,8 +1041,10 @@ namespace {
         DenseMap<Value*, Value*> parentMap;
         // maps each pointer rep to its pointee rep
         DenseMap<Value*, Value*> pointsToMap;
-        // alloca nodes used as unique abstract memory locs
+        // abstract memory objects created for analysis
         SmallVector<Value*, 8> AbstractObjects;
+
+        Value* UnknownMemory = nullptr;
 
         SteensgaardPTA(Function& F_) : F(F_) {}
 
@@ -1092,7 +1094,7 @@ namespace {
             auto* AbstractObj = new AllocaInst(
                 Type::getInt8Ty(F.getContext()),
                 0,
-                "pta.abstract",
+                "pta.sentinel",
                 F.getEntryBlock().getFirstNonPHIIt()
             );
 
@@ -1105,11 +1107,34 @@ namespace {
             Value* RepP = find(P);
 
             if (!pointsToMap.count(RepP)) {
-                // give each unknown pointer its own unique abstract obj
-                pointsToMap[RepP] = makeAbstractObject();
+                // unknown pointees share one conservative abstract memory object
+                pointsToMap[RepP] = getUnknownMemory();
             }
 
             return find(pointsToMap[RepP]);
+        }
+
+        // return known pointee info without creating new abstract objects
+        // used by mayAlias() so alias queries do not mutate analysis state
+        Value* getKnownPointee(Value* P) {
+            if (!parentMap.count(P)) {
+                return nullptr;
+            }
+
+            Value* RepP = find(P);
+
+            if (!pointsToMap.count(RepP)) {
+                return nullptr;
+            }
+
+            return find(pointsToMap[RepP]);
+        }
+
+        Value* getUnknownMemory() {
+            if (!UnknownMemory) {
+                UnknownMemory = makeAbstractObject();
+            }
+            return UnknownMemory;
         }
 
         // set P to point to Obj
@@ -1125,12 +1150,46 @@ namespace {
             }
         }
 
+        // init a pointer-typed value during analysis construction
+        void initializePointerValue(Value* V) {
+            if (!V || !V->getType()->isPointerTy()) {
+                return;
+            }
+
+            find(V);
+
+            Value* RepV = find(V);
+
+            if (!pointsToMap.count(RepV)) {
+                Value* Obj = makeAbstractObject();
+                setPointee(V, Obj);
+            }
+        }
+
+        bool isComplexPointer(Value* V) {
+            V = V->stripPointerCasts();
+
+            if (isa<GetElementPtrInst>(V) || isa<GEPOperator>(V)) {
+                return true;
+            }
+
+            if (isa<LoadInst>(V)) {
+                return true;
+            }
+
+            if (isa<PHINode>(V) || isa<SelectInst>(V)) {
+                return true;
+            }
+
+            return false;
+        }
+
         void run() {
-            // pointer arguments are known pointer vals
-            // treat each as initially pointing to its own abstract obj
+            // pointer arguments start as distinct abstract objects in this intraprocedural model
             for (Argument& Arg : F.args()) {
                 if (Arg.getType()->isPointerTy()) {
                     find(&Arg);
+
                     Value* ArgObj = makeAbstractObject();
                     setPointee(&Arg, ArgObj);
                 }
@@ -1139,54 +1198,113 @@ namespace {
             // flow-insensitive scan: process each instruction once
             for (BasicBlock& BB : F) {
                 for (Instruction& I : BB) {
-
-                    // alloca creates a fresh stack obj, result is a pointer to obj
+                    // alloca creates a fresh stack object.
+                    // The alloca result is a pointer to that object.
                     if (auto* AllocaI = dyn_cast<AllocaInst>(&I)) {
+                        // skip abstract objects inserted by makeAbstractObject()
+                        if (AllocaI->getName().starts_with("pta.sentinel")) {
+                            continue;
+                        }
+
                         find(AllocaI);
-                        Value* AllocObj = makeAbstractObject();
-                        setPointee(AllocaI, AllocObj);
+
+                        if (!pointsToMap.count(find(AllocaI))) {
+                            Value* AllocObj = makeAbstractObject();
+                            setPointee(AllocaI, AllocObj);
+                        }
+
                         continue;
                     }
 
-                    // bitcast preserves pointer id
+                    // init pointer operands before modeling the instruction
+                    for (Use& U : I.operands()) {
+                        Value* Op = U.get();
+                        if (Op && Op->getType()->isPointerTy()) {
+                            initializePointerValue(Op);
+                        }
+                    }
+
+                    // PHI nodes merge incoming pointer values
+                    if (auto* PhiI = dyn_cast<PHINode>(&I)) {
+                        if (PhiI->getType()->isPointerTy()) {
+                            find(PhiI);
+
+                            for (Value* Incoming : PhiI->incoming_values()) {
+                                if (Incoming && Incoming->getType()->isPointerTy()) {
+                                    initializePointerValue(Incoming);
+                                    unite(PhiI, Incoming);
+                                }
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    // select merges one of two possible pointer values
+                    if (auto* SelectI = dyn_cast<SelectInst>(&I)) {
+                        if (SelectI->getType()->isPointerTy()) {
+                            find(SelectI);
+
+                            Value* TrueValue = SelectI->getTrueValue();
+                            Value* FalseValue = SelectI->getFalseValue();
+
+                            if (TrueValue && TrueValue->getType()->isPointerTy()) {
+                                initializePointerValue(TrueValue);
+                                unite(SelectI, TrueValue);
+                            }
+
+                            if (FalseValue && FalseValue->getType()->isPointerTy()) {
+                                initializePointerValue(FalseValue);
+                                unite(SelectI, FalseValue);
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    // bitcast preserves pointer identity
                     if (auto* BitcastI = dyn_cast<BitCastInst>(&I)) {
                         if (BitcastI->getType()->isPointerTy() &&
                             BitcastI->getOperand(0)->getType()->isPointerTy()) {
+                            find(BitcastI);
+                            initializePointerValue(BitcastI->getOperand(0));
                             unite(BitcastI, BitcastI->getOperand(0));
                         }
+
                         continue;
                     }
 
-                    // gep field-insensitive - derived from the base pointer
+                    // GEP is field-insensitive / offset-insensitive here
                     if (auto* GEPI = dyn_cast<GetElementPtrInst>(&I)) {
                         if (GEPI->getType()->isPointerTy() &&
                             GEPI->getPointerOperand()->getType()->isPointerTy()) {
+                            find(GEPI);
+                            initializePointerValue(GEPI->getPointerOperand());
                             unite(GEPI, GEPI->getPointerOperand());
                         }
+
                         continue;
                     }
-                    // if x = load p and x is a pointer, then x receives the pointee of p
-                    
+
+                    // If x = load p and x is a pointer,
+                    // then x is treated conservatively because the simplified
+                    // intraprocedural analysis may not know the exact stored pointer
                     if (auto* LoadI = dyn_cast<LoadInst>(&I)) {
+                        Value* Ptr = LoadI->getPointerOperand();
+
                         if (LoadI->getType()->isPointerTy()) {
-                            // models x = *p at the pointee level instead of unifying x with p
-                            Value* Ptr = LoadI->getPointerOperand();
+                            initializePointerValue(Ptr);
+
                             Value* Pointee = getPointee(Ptr);
                             unite(LoadI, Pointee);
                         }
+
                         continue;
                     }
-                    // if store q, p and q is a pointer, then *p receives q
-                    if (auto* StoreI = dyn_cast<StoreInst>(&I)) {
-                        Value* StoredValue = StoreI->getValueOperand();
-                        Value* StoreDest = StoreI->getPointerOperand();
 
-                        if (StoredValue->getType()->isPointerTy()) {
-                            // unifies the pointee of p with q, not p with q
-                            Value* DestPointee = getPointee(StoreDest);
-                            unite(DestPointee, StoredValue);
-                        }
-                        continue;
+                    // fallback: track any other pointer-typed instruction result
+                    if (I.getType()->isPointerTy()) {
+                        initializePointerValue(&I);
                     }
                 }
             }
@@ -1200,15 +1318,23 @@ namespace {
             if (!A->getType()->isPointerTy() || !B->getType()->isPointerTy()) {
                 return false;
             }
+            if (isComplexPointer(A) || isComplexPointer(B)) {
+                return true;
+            }
 
+            // conservative for truly unknown vals
             if (!parentMap.count(A) || !parentMap.count(B)) {
                 return true;
             }
 
-            // pointer expressions may alias if their pointee reps match
-            Value* PointeeA = getPointee(A);
-            Value* PointeeB = getPointee(B);
+            Value* PointeeA = getKnownPointee(A);
+            Value* PointeeB = getKnownPointee(B);
 
+            if (!PointeeA || !PointeeB) {
+                return true;
+            }
+
+            // pointer expressions may alias if their pointee reps match
             return find(PointeeA) == find(PointeeB);
         }
     };
